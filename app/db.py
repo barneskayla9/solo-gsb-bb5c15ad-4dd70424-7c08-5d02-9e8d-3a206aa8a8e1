@@ -1,4 +1,4 @@
-"""PostgreSQL 访问层：建表、快照读取、整网导入、隔离提交、复供确认。"""
+"""PostgreSQL 访问层：建表、快照读取、整网导入、隔离提交、复供确认、局部修订。"""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,15 @@ import psycopg2.extras
 from psycopg2.errors import UndefinedTable
 
 from .config import get_settings
-from .planning import EVENT_PENDING, EVENT_RESTORED, IsolationEvent, Node, Pipe, PlanResult
+from .planning import (
+    EVENT_PENDING,
+    EVENT_RESTORED,
+    IsolationEvent,
+    Node,
+    Pipe,
+    PlanResult,
+    Revision,
+)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS network_meta (
@@ -69,6 +77,16 @@ ALTER TABLE isolation_events ADD COLUMN IF NOT EXISTS reopened_pipe_ids JSONB
     NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_isolation_events_status ON isolation_events (status);
+
+CREATE TABLE IF NOT EXISTS network_revisions (
+    id             BIGSERIAL PRIMARY KEY,
+    revision_no    INTEGER NOT NULL UNIQUE,
+    version_before INTEGER NOT NULL,
+    version_after  INTEGER NOT NULL,
+    change_ids     JSONB NOT NULL,
+    change_count   INTEGER NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -164,6 +182,7 @@ def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
             cur.execute("INSERT INTO network_meta (id, version) VALUES (1, 0)")
 
         cur.execute("TRUNCATE isolation_events")
+        cur.execute("TRUNCATE network_revisions")
         cur.execute("TRUNCATE pipes")
         cur.execute("TRUNCATE nodes")
 
@@ -186,6 +205,127 @@ def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
 
 
 # ---------------------------------------------------------------- 隔离提交
+
+
+def revision_change_ids(revision: Revision) -> list[dict]:
+    """按请求顺序列出本次修订涉及的全部变更及对象编号（用于落库/返回）。"""
+    changes: list[dict] = []
+    changes.extend({"op": "add_node", "node_id": n.id} for n in revision.add_nodes)
+    changes.extend({"op": "add_pipe", "pipe_id": p.id} for p in revision.add_pipes)
+    changes.extend(
+        {"op": "update_node", "node_id": p.id} for p in revision.update_nodes
+    )
+    changes.extend(
+        {"op": "update_pipe", "pipe_id": p.id} for p in revision.update_pipes
+    )
+    changes.extend(
+        {"op": "delete_node", "node_id": nid} for nid in revision.delete_node_ids
+    )
+    changes.extend(
+        {"op": "delete_pipe", "pipe_id": pid} for pid in revision.delete_pipe_ids
+    )
+    return changes
+
+
+def apply_revision(
+    conn,
+    expected_version: int,
+    revision: Revision,
+    new_nodes: dict[str, Node],
+    new_pipes: dict[str, Pipe],
+    change_ids: list[dict],
+) -> dict:
+    """在已开启的事务中原子应用局部修订。
+
+    调用方须已用当前快照完成 evaluate_revision 且无违约。本函数只负责：
+    锁版本行 -> 版本比对 -> 增删改节点/管段（绝不触碰 valve_closed 列）
+    -> 版本 +1 -> 写修订记录。版本过期抛出 VersionConflict，由外层回滚。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
+        row = cur.fetchone()
+        current_version = row[0] if row else 0
+        if current_version != expected_version:
+            raise VersionConflict(current_version, expected_version)
+
+        delete_pipe_ids = list(revision.delete_pipe_ids)
+        delete_node_ids = list(revision.delete_node_ids)
+        if delete_pipe_ids:
+            cur.execute("DELETE FROM pipes WHERE id = ANY(%s)", (delete_pipe_ids,))
+        if delete_node_ids:
+            cur.execute("DELETE FROM nodes WHERE id = ANY(%s)", (delete_node_ids,))
+
+        add_nodes = list(revision.add_nodes)
+        if add_nodes:
+            cur.executemany(
+                "INSERT INTO nodes (id, type, name) VALUES (%s, %s, %s)",
+                [(n.id, n.type, n.name) for n in add_nodes],
+            )
+
+        add_pipes = list(revision.add_pipes)
+        if add_pipes:
+            # 新管段阀门默认开启：valve_closed 恒为 FALSE
+            cur.executemany(
+                "INSERT INTO pipes (id, from_node, to_node, has_valve, "
+                "valve_closed, name) VALUES (%s, %s, %s, %s, FALSE, %s)",
+                [
+                    (p.id, p.from_node, p.to_node, p.has_valve, p.name)
+                    for p in add_pipes
+                ],
+            )
+
+        update_node_ids = {p.id for p in revision.update_nodes}
+        if update_node_ids:
+            cur.executemany(
+                "UPDATE nodes SET type = %s, name = %s WHERE id = %s",
+                [
+                    (new_nodes[nid].type, new_nodes[nid].name, nid)
+                    for nid in update_node_ids
+                ],
+            )
+
+        update_pipe_ids = {p.id for p in revision.update_pipes}
+        if update_pipe_ids:
+            cur.executemany(
+                # 只更新拓扑/属性列；阀位列 valve_closed 永不被修订修改
+                "UPDATE pipes SET from_node = %s, to_node = %s, has_valve = %s, "
+                "name = %s WHERE id = %s",
+                [
+                    (
+                        new_pipes[pid].from_node,
+                        new_pipes[pid].to_node,
+                        new_pipes[pid].has_valve,
+                        new_pipes[pid].name,
+                        pid,
+                    )
+                    for pid in update_pipe_ids
+                ],
+            )
+
+        new_version = current_version + 1
+        cur.execute(
+            "UPDATE network_meta SET version = %s, updated_at = now() WHERE id = 1",
+            (new_version,),
+        )
+        cur.execute(
+            "INSERT INTO network_revisions "
+            "(revision_no, version_before, version_after, change_ids, change_count) "
+            "SELECT COALESCE(MAX(revision_no), 0) + 1, %s, %s, %s::jsonb, %s "
+            "FROM network_revisions RETURNING id",
+            (
+                current_version,
+                new_version,
+                json.dumps(change_ids),
+                len(change_ids),
+            ),
+        )
+        revision_id = cur.fetchone()[0]
+
+    return {
+        "version": new_version,
+        "revision_id": revision_id,
+        "change_ids": change_ids,
+    }
 
 
 def submit_isolation(

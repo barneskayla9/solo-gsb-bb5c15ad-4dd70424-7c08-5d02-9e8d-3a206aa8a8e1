@@ -28,6 +28,7 @@ class FakeStore:
         self.pipes: dict[str, Pipe] = {}
         self.events = []
         self.next_event_id = 1
+        self.revision_no = 0
         self.fail_commit = False
 
 
@@ -82,7 +83,38 @@ def fake_replace_network(conn, nodes, pipes):
     STORE.pipes = {p.id: p for p in pipes}
     STORE.events = []
     STORE.next_event_id = 1
+    STORE.revision_no = 0
     return 1
+
+
+def fake_revision_change_ids(revision):
+    # 与 db.revision_change_ids 相同的记账规则
+    from app.planning import Revision  # noqa: F401
+
+    changes = []
+    changes.extend({"op": "add_node", "node_id": n.id} for n in revision.add_nodes)
+    changes.extend({"op": "add_pipe", "pipe_id": p.id} for p in revision.add_pipes)
+    changes.extend({"op": "update_node", "node_id": p.id} for p in revision.update_nodes)
+    changes.extend({"op": "update_pipe", "pipe_id": p.id} for p in revision.update_pipes)
+    changes.extend({"op": "delete_node", "node_id": nid} for nid in revision.delete_node_ids)
+    changes.extend({"op": "delete_pipe", "pipe_id": pid} for pid in revision.delete_pipe_ids)
+    return changes
+
+
+def fake_apply_revision(conn, expected_version, revision, new_nodes, new_pipes, change_ids):
+    # 复制 db.apply_revision 关键语义：锁行版本比对 -> 候选管网落盘 -> +1
+    if STORE.version != expected_version:
+        raise db.VersionConflict(STORE.version, expected_version)
+    STORE.nodes = dict(new_nodes)
+    STORE.pipes = dict(new_pipes)
+    before = STORE.version
+    STORE.version = before + 1
+    STORE.revision_no = getattr(STORE, "revision_no", 0) + 1
+    return {
+        "version": STORE.version,
+        "revision_id": STORE.revision_no,
+        "change_ids": change_ids,
+    }
 
 
 def fake_submit_isolation(conn, expected_version, fault_pipe_id, close_pipe_ids, result):
@@ -176,6 +208,8 @@ db.transaction = fake_transaction
 db.init_db = fake_init_db
 db.load_snapshot = fake_load_snapshot
 db.replace_network = fake_replace_network
+db.apply_revision = fake_apply_revision
+db.revision_change_ids = fake_revision_change_ids
 db.submit_isolation = fake_submit_isolation
 db.list_events = fake_list_events
 db.load_event = fake_load_event
@@ -673,6 +707,269 @@ class RestoreTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "EVENT_NOT_FOUND")
+
+
+class RevisionApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.revision_no = 0
+        STORE.fail_commit = False
+
+    def _import(self):
+        r = self.client.post("/api/network/import", json=VALID_NETWORK)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _isolate_p6(self):
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_revise_add_pipe_and_nodes_happy_path(self):
+        self._import()
+        payload = {
+            "version": 1,
+            "add_nodes": [
+                {"id": "X", "type": "junction"},
+                {"id": "U9", "type": "sink", "name": "新区"},
+            ],
+            "add_pipes": [
+                {"id": "Q1", "from": "A", "to": "X", "has_valve": True},
+                {"id": "Q2", "from": "X", "to": "U9", "has_valve": False},
+            ],
+        }
+        r = self.client.post("/api/network/revise", json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 2)
+        self.assertEqual(body["revision_no"], 1)
+        self.assertEqual(body["change_count"], 4)
+        ops = [(c["op"], c.get("node_id") or c.get("pipe_id")) for c in body["change_ids"]]
+        self.assertEqual(
+            ops,
+            [
+                ("add_node", "X"),
+                ("add_node", "U9"),
+                ("add_pipe", "Q1"),
+                ("add_pipe", "Q2"),
+            ],
+        )
+        # 新管段阀门默认开启
+        r = self.client.get("/api/network")
+        q1 = next(p for p in r.json()["pipes"] if p["id"] == "Q1")
+        self.assertFalse(q1["valve_closed"])
+        # 隔离事件未被清空（本场景本来就无事件）
+        self.assertEqual(STORE.version, 2)
+
+    def test_revise_update_and_delete(self):
+        self._import()
+        payload = {
+            "version": 1,
+            "update_nodes": [{"id": "B", "name": "二号点"}],
+            "update_pipes": [{"id": "P5", "name": "医院支管"}],
+            "delete_pipe_ids": ["P3"],
+            "delete_node_ids": ["U1"],
+        }
+        r = self.client.post("/api/network/revise", json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 2)
+        self.assertEqual(body["node_count"], 6)
+        self.assertEqual(body["pipe_count"], 5)
+        r = self.client.get("/api/network")
+        b = next(n for n in r.json()["nodes"] if n["id"] == "B")
+        self.assertEqual(b["name"], "二号点")
+        self.assertNotIn("U1", {n["id"] for n in r.json()["nodes"]})
+
+    def test_revise_version_conflict(self):
+        self._import()
+        r = self.client.post(
+            "/api/network/revise",
+            json={"version": 99, "update_nodes": [{"id": "B", "name": "x"}]},
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "VERSION_CONFLICT")
+        self.assertEqual(STORE.version, 1)
+
+    def test_revise_empty_changeset(self):
+        self._import()
+        r = self.client.post("/api/network/revise", json={"version": 1})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "REVISION_INVALID")
+        self.assertIn("CHANGESET_EMPTY", r.text)
+
+    def test_revise_new_pipe_valve_must_default_open(self):
+        self._import()
+        # 新管段不接受 valve_closed 入参（新阀默认开启，关阀走隔离提交）
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 1,
+                "add_nodes": [{"id": "X", "type": "junction"}],
+                "add_pipes": [
+                    {"id": "Q1", "from": "A", "to": "X", "has_valve": True,
+                     "valve_closed": True}
+                ],
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+        # 拒绝后无部分变更
+        self.assertEqual(STORE.version, 1)
+        self.assertNotIn("X", STORE.nodes)
+
+    def test_revise_new_pipe_defaults_open_without_field(self):
+        self._import()
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 1,
+                "add_nodes": [{"id": "X", "type": "junction"}],
+                "add_pipes": [
+                    {"id": "Q1", "from": "A", "to": "X", "has_valve": True}
+                ],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        q1 = next(
+            p for p in self.client.get("/api/network").json()["pipes"] if p["id"] == "Q1"
+        )
+        self.assertFalse(q1["valve_closed"])
+
+    def test_revise_existing_valve_state_immutable(self):
+        self._import()
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 1,
+                "update_pipes": [{"id": "P1", "valve_closed": True}],
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("VALVE_STATE_IMMUTABLE", r.text)
+
+    def test_revise_candidate_self_loop_and_dangling(self):
+        self._import()
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 1,
+                "add_pipes": [
+                    {"id": "Q1", "from": "A", "to": "A"},
+                    {"id": "Q2", "from": "A", "to": "ZZ"},
+                ],
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("PIPE_SELF_LOOP", codes)
+        self.assertIn("PIPE_ENDPOINT_UNKNOWN", codes)
+
+    def test_revise_protects_pending_event_objects(self):
+        self._import()
+        self._isolate_p6()  # 事件 #1 待修复：故障 P6、关阀 P4、失供 U3
+        # 版本现为 2；删除受保护对象
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 2,
+                "delete_pipe_ids": ["P6", "P4"],
+                "delete_node_ids": ["U3"],
+            },
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("PROTECTED_PIPE_DELETE", codes)
+        self.assertIn("PROTECTED_SINK_DELETE", codes)
+
+        # 改动受保护属性：P6 端点、P4 阀门属性、U3 类型
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 2,
+                "update_pipes": [
+                    {"id": "P6", "from": "B"},
+                    {"id": "P4", "has_valve": False},
+                ],
+                "update_nodes": [{"id": "U3", "type": "junction"}],
+            },
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("PROTECTED_PIPE_ENDPOINT_CHANGE", codes)
+        self.assertIn("PROTECTED_PIPE_VALVE_CHANGE", codes)
+        self.assertIn("PROTECTED_SINK_TYPE_CHANGE", codes)
+        # 事务回滚：版本/阀位/管网不变，事件保留
+        self.assertEqual(STORE.version, 2)
+        self.assertTrue(STORE.pipes["P4"].valve_closed)
+        self.assertEqual(STORE.events[0]["status"], "pending")
+
+    def test_revise_bypass_rewaters_pending_fault(self):
+        self._import()
+        self._isolate_p6()
+        # 新增 B-U3 旁通管（阀门默认开启）：绕过关闭的 P4 -> P6 的 U3 端重新进水
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 2,
+                "add_pipes": [{"id": "P9", "from": "B", "to": "U3", "has_valve": True}],
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("PENDING_FAULT_REWATER", codes)
+        issue = next(
+            i for i in r.json()["error"]["issues"] if i["code"] == "PENDING_FAULT_REWATER"
+        )
+        self.assertEqual(issue["event_id"], 1)
+        self.assertEqual(issue["pipe_id"], "P6")
+        # 拒绝后不写入
+        self.assertNotIn("P9", STORE.pipes)
+        self.assertEqual(STORE.version, 2)
+
+    def test_revise_safe_while_pending_event_kept(self):
+        self._import()
+        self._isolate_p6()
+        # 在与隔离区无关的支路上改名，且隔离事件不清空
+        r = self.client.post(
+            "/api/network/revise",
+            json={
+                "version": 2,
+                "update_nodes": [{"id": "U1", "name": "幸福北苑"}],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["version"], 3)
+        # 待修复事件仍在，P4 仍关闭
+        self.assertTrue(STORE.pipes["P4"].valve_closed)
+        self.assertEqual(len(STORE.events), 1)
+        self.assertEqual(STORE.events[0]["status"], "pending")
+        # 版本 3 下仍可安全复供
+        r = self.client.post(
+            "/api/isolation/events/1/restore/confirm", json={"version": 3}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(STORE.pipes["P4"].valve_closed)
+
+    def test_revise_rollback_on_failure_leaves_state_untouched(self):
+        self._import()
+        STORE.fail_commit = True
+        with self.assertRaises(RuntimeError):
+            self.client.post(
+                "/api/network/revise",
+                json={"version": 1, "update_nodes": [{"id": "B", "name": "x"}]},
+            )
+        self.assertEqual(STORE.version, 1)
+        self.assertIsNone(STORE.nodes["B"].name)
 
 
 if __name__ == "__main__":

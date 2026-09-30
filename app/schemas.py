@@ -55,6 +55,68 @@ class RestoreIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号")
 
 
+# ------------------------------------------------------- 局部修订（增改删）
+
+
+class AddNodeIn(NodeIn):
+    """新增节点：与整网导入节点同构。"""
+
+
+class AddPipeIn(PipeIn):
+    """新增管段：阀门默认开启。
+
+    继承整网管段结构，但显式移除 valve_closed 入参 —— 新管段阀门只能默认开启，
+    关阀必须走隔离提交流程（传入 valve_closed 会得到请求体校验错误 422）。
+    """
+
+    valve_closed: None = Field(
+        default=None,
+        exclude=True,
+        description="禁止字段：新管段阀门默认开启，关阀请走隔离提交",
+    )
+
+
+class UpdateNodeIn(BaseModel):
+    id: str = Field(min_length=1, description="待更新节点编号")
+    # 缺省 = 保持原值；不使用 Optional 默认，避免“未给出”与“显式置空名称”混淆
+    type: NodeType | None = Field(default=None, description="节点类型；缺省保持原值")
+    name: str | None = Field(default=None, description="名称；显式 null 清空，缺省保持原值")
+
+    model_config = {"extra": "forbid"}
+
+    def fields_provided(self) -> set[str]:
+        return set(self.model_fields_set)
+
+
+class UpdatePipeIn(BaseModel):
+    id: str = Field(min_length=1, description="待更新管段编号")
+    from_: str | None = Field(default=None, validation_alias="from")
+    to_: str | None = Field(default=None, validation_alias="to")
+    has_valve: bool | None = Field(default=None, description="是否有阀；缺省保持原值")
+    valve_closed: bool | None = Field(
+        default=None,
+        description="禁止字段：阀位只能由隔离提交/复供确认改变，给出即判违约",
+    )
+    name: str | None = Field(default=None, description="名称；显式 null 清空，缺省保持原值")
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+    def fields_provided(self) -> set[str]:
+        return set(self.model_fields_set)
+
+
+class RevisionIn(BaseModel):
+    """局部修订入参：基准版本 + 增/改/删变更列表（每项须带对象编号）。"""
+
+    version: int = Field(ge=0, description="基准管网版本号（读取管网时获得）")
+    add_nodes: list[AddNodeIn] = Field(default_factory=list)
+    add_pipes: list[AddPipeIn] = Field(default_factory=list)
+    update_nodes: list[UpdateNodeIn] = Field(default_factory=list)
+    update_pipes: list[UpdatePipeIn] = Field(default_factory=list)
+    delete_node_ids: list[str] = Field(default_factory=list)
+    delete_pipe_ids: list[str] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -80,6 +142,28 @@ class ImportOut(BaseModel):
     pipe_count: int
 
 
+class ChangeOut(BaseModel):
+    op: Literal[
+        "add_node",
+        "add_pipe",
+        "update_node",
+        "update_pipe",
+        "delete_node",
+        "delete_pipe",
+    ]
+    node_id: str | None = None
+    pipe_id: str | None = None
+
+
+class RevisionOut(BaseModel):
+    version: int = Field(description="修订后的新版本号")
+    revision_no: int = Field(description="修订流水号（按当前管网累计，整网导入后归零）")
+    change_ids: list[ChangeOut] = Field(description="本次变更及对象编号列表")
+    change_count: int
+    node_count: int
+    pipe_count: int
+
+
 class NetworkOut(BaseModel):
     version: int
     updated_at: datetime | None = None
@@ -94,6 +178,8 @@ class IssueOut(BaseModel):
     # 复供阻断原因可能引用具体待修复事件与相关管段（可选，保持向后兼容）
     event_id: int | None = None
     related_pipe_id: str | None = None
+    # 节点类问题（修订）可能引用节点编号（可选，保持向后兼容）
+    node_id: str | None = None
 
 
 class PreviewOut(BaseModel):

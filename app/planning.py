@@ -14,6 +14,15 @@
   事件的故障管段以及其余仍关闭的阀门。
 - 仅当重开后，其他待修复事件的故障管段**两端仍均无法从水源到达**
   （不会被重新进水）时，才允许确认复供。
+
+局部修订（现场测绘纠错，evaluate_revision）：
+- 按基准版本增改删节点/管段，不清空隔离事件；每个变更须带对象编号。
+- 新管段阀门默认开启；现有阀位只能由隔离提交/复供确认改变。
+- 先在完整候选管网上做与导入相同的结构校验（编号唯一/端点存在/无自环/无阀管段不可关闭）。
+- 待修复事件引用的故障管段、关阀管段、失供用水点不得删除；
+  其管段端点、阀门属性与用水点类型不得改动。
+- 修订后按“当前关阀 ∪ 待修复故障管段”断开的通水图复核：每条待修复故障管段
+  两端仍须均不可从水源到达，否则拒绝（PENDING_FAULT_REWATER）。
 """
 from __future__ import annotations
 
@@ -39,6 +48,33 @@ DUPLICATE_PIPE_ID = "DUPLICATE_PIPE_ID"
 PIPE_SELF_LOOP = "PIPE_SELF_LOOP"
 PIPE_ENDPOINT_UNKNOWN = "PIPE_ENDPOINT_UNKNOWN"
 NON_VALVE_PIPE_CLOSED = "NON_VALVE_PIPE_CLOSED"
+
+# 局部修订期问题 -----------------------------------------------------------
+# 变更集记账
+CHANGESET_EMPTY = "CHANGESET_EMPTY"
+ADD_NODE_ID_EXISTS = "ADD_NODE_ID_EXISTS"
+ADD_PIPE_ID_EXISTS = "ADD_PIPE_ID_EXISTS"
+ADD_NODE_DUPLICATE = "ADD_NODE_DUPLICATE"
+ADD_PIPE_DUPLICATE = "ADD_PIPE_DUPLICATE"
+UPDATE_NODE_NOT_FOUND = "UPDATE_NODE_NOT_FOUND"
+UPDATE_PIPE_NOT_FOUND = "UPDATE_PIPE_NOT_FOUND"
+DELETE_NODE_NOT_FOUND = "DELETE_NODE_NOT_FOUND"
+DELETE_PIPE_NOT_FOUND = "DELETE_PIPE_NOT_FOUND"
+DELETE_NODE_DUPLICATE = "DELETE_NODE_DUPLICATE"
+DELETE_PIPE_DUPLICATE = "DELETE_PIPE_DUPLICATE"
+CHANGE_TARGET_DUPLICATE = "CHANGE_TARGET_DUPLICATE"
+CHANGE_TARGET_CONFLICT = "CHANGE_TARGET_CONFLICT"
+# 阀位规则：新管段阀门默认开启；现有阀位只能由隔离/复供流程改变
+NEW_PIPE_VALVE_CLOSED = "NEW_PIPE_VALVE_CLOSED"
+VALVE_STATE_IMMUTABLE = "VALVE_STATE_IMMUTABLE"
+# 待修复事件引用保护
+PROTECTED_PIPE_DELETE = "PROTECTED_PIPE_DELETE"
+PROTECTED_SINK_DELETE = "PROTECTED_SINK_DELETE"
+PROTECTED_PIPE_ENDPOINT_CHANGE = "PROTECTED_PIPE_ENDPOINT_CHANGE"
+PROTECTED_PIPE_VALVE_CHANGE = "PROTECTED_PIPE_VALVE_CHANGE"
+PROTECTED_SINK_TYPE_CHANGE = "PROTECTED_SINK_TYPE_CHANGE"
+# 修订通水复核：修订使待修复故障管段端点重新可从水源到达
+PENDING_FAULT_REWATER = "PENDING_FAULT_REWATER"
 
 # 隔离事件状态
 EVENT_PENDING = "pending"      # 待修复
@@ -81,6 +117,8 @@ class Issue:
     # 可选的附加引用：阻断用水点的待修复事件 / 具体管段编号
     event_id: int | None = None
     related_pipe_id: str | None = None
+    # 节点类问题引用的节点编号（可选，保持向后兼容）
+    node_id: str | None = None
 
     def as_dict(self) -> dict:
         d = {"code": self.code, "message": self.message, "pipe_id": self.pipe_id}
@@ -88,6 +126,8 @@ class Issue:
             d["event_id"] = self.event_id
         if self.related_pipe_id is not None:
             d["related_pipe_id"] = self.related_pipe_id
+        if self.node_id is not None:
+            d["node_id"] = self.node_id
         return d
 
 
@@ -504,3 +544,439 @@ def evaluate_restoration(
         remaining_closed_pipe_ids=sorted(remaining_closed),
         remaining_fault_pipe_ids=sorted(pending_fault_ids),
     )
+
+
+# ---------------------------------------------------------------- 局部修订
+#
+# 现场测绘发现管网资料有误时，操作员按基准版本对管网做局部增改删，
+# 不清空既有隔离事件（含待修复事件）。修订规则：
+#   - 请求列明每个变更与其对象编号；
+#   - 新管段阀门默认开启（不得在修订中置为关闭）；
+#   - 现有阀位只能由隔离提交/复供确认改变，修订不得改 valve_closed；
+#   - 先在“完整候选管网”上做与整网导入相同的结构校验
+#     （编号唯一、端点存在、无自环、无阀管段不可关闭）；
+#   - 待修复事件引用的故障管段、关阀管段、失供用水点不得删除；
+#     故障/关阀管段的端点、阀门属性与失供用水点类型不得改动；
+#   - 修订后按“当前关阀 ∪ 待修复故障管段”断开的通水图复核：
+#     每条待修复故障管段两端仍须均不可从水源到达。
+
+# 补丁字段“保持原值”的哨兵（None 表示显式置空名称）
+UNCHANGED = object()
+
+
+@dataclass(frozen=True)
+class NodePatch:
+    id: str
+    type: str | object = UNCHANGED
+    name: str | object | None = UNCHANGED
+
+
+@dataclass(frozen=True)
+class PipePatch:
+    id: str
+    from_node: str | object = UNCHANGED
+    to_node: str | object = UNCHANGED
+    has_valve: bool | object = UNCHANGED
+    # 阀位不可由修订改变；仅当请求显式给出时用于产生违规明细
+    valve_closed: bool | object = UNCHANGED
+    name: str | object | None = UNCHANGED
+
+
+@dataclass(frozen=True)
+class Revision:
+    """一次局部修订请求（编号即为对象自身的业务编号）。"""
+
+    add_nodes: tuple[Node, ...] = ()
+    add_pipes: tuple[Pipe, ...] = ()
+    update_nodes: tuple[NodePatch, ...] = ()
+    update_pipes: tuple[PipePatch, ...] = ()
+    delete_node_ids: tuple[str, ...] = ()
+    delete_pipe_ids: tuple[str, ...] = ()
+
+    def is_empty(self) -> bool:
+        return not (
+            self.add_nodes
+            or self.add_pipes
+            or self.update_nodes
+            or self.update_pipes
+            or self.delete_node_ids
+            or self.delete_pipe_ids
+        )
+
+
+@dataclass
+class RevisionResult:
+    issues: list[Issue]
+    nodes: dict[str, Node] = field(default_factory=dict)
+    pipes: dict[str, Pipe] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return not self.issues
+
+
+def evaluate_revision(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    revision: Revision,
+    pending_events: list[IsolationEvent] | None = None,
+) -> RevisionResult:
+    """评估局部修订：返回全部违约明细；无违约时给出修订后的候选管网。
+
+    评估过程不修改入参。版本比对与原子写入由调用方（db 层）负责。
+    """
+    issues: list[Issue] = []
+
+    if revision.is_empty():
+        issues.append(Issue(CHANGESET_EMPTY, "变更集为空：至少需要一项增、改或删"))
+        return RevisionResult(issues)
+
+    pending = [e for e in (pending_events or []) if e.status == EVENT_PENDING]
+    protected_pipes: dict[str, list[IsolationEvent]] = {}
+    protected_sinks: dict[str, list[IsolationEvent]] = {}
+    for e in pending:
+        protected_pipes.setdefault(e.fault_pipe_id, []).append(e)
+        for pid in e.closed_pipe_ids:
+            protected_pipes.setdefault(pid, []).append(e)
+        for sid in e.affected_sink_ids:
+            protected_sinks.setdefault(sid, []).append(e)
+
+    # ---- 1. 变更集记账：重号 / 不存在 / 同对象多操作 / 阀位规则 ----------
+    add_node_by_id, add_pipe_by_id = _audit_revision(nodes, pipes, revision, issues)
+
+    # ---- 2. 待修复事件引用保护 ------------------------------------------
+    _check_revision_protection(
+        revision, protected_pipes, protected_sinks, issues
+    )
+
+    # ---- 3. 构建候选管网：先删，再增/改 ---------------------------------
+    cand_nodes, cand_pipes = _apply_revision_to_snapshot(nodes, pipes, revision)
+
+    # ---- 4. 完整候选管网结构校验（同整网导入） --------------------------
+    issues.extend(
+        validate_import(
+            [cand_nodes[nid] for nid in sorted(cand_nodes)],
+            [cand_pipes[pid] for pid in sorted(cand_pipes)],
+        )
+    )
+
+    # ---- 5. 关阀 + 待修复故障断开图上的通水复核 -------------------------
+    closed_valves = frozenset(
+        p.id
+        for p in cand_pipes.values()
+        if p.has_valve and p.valve_closed and p.id not in revision.delete_pipe_ids
+    )
+    removed = closed_valves | frozenset(protected_pipes)
+    reachable = _reachable(cand_nodes, list(cand_pipes.values()), removed)
+    seen_fault: set[str] = set()
+    for e in sorted(pending, key=lambda ev: ev.id):
+        fid = e.fault_pipe_id
+        if fid in seen_fault:
+            continue
+        seen_fault.add(fid)
+        fault = cand_pipes.get(fid)
+        if fault is None:
+            # 已在结构/保护检查中给出明细，跳过可达性复核
+            continue
+        wet_ends = sorted(
+            end for end in (fault.from_node, fault.to_node) if end in reachable
+        )
+        if wet_ends:
+            issues.append(
+                Issue(
+                    PENDING_FAULT_REWATER,
+                    (
+                        f"修订被拒绝：待修复事件 #{e.id} 的故障管段 {fid} 的端点 "
+                        f"{wet_ends} 在修订后的通水图中可重新从水源到达（重新进水）"
+                    ),
+                    pipe_id=fid,
+                    event_id=e.id,
+                )
+            )
+
+    if issues:
+        return RevisionResult(issues)
+    return RevisionResult([], cand_nodes, cand_pipes)
+
+
+def _audit_revision(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    revision: Revision,
+    issues: list[Issue],
+) -> tuple[dict[str, Node], dict[str, Pipe]]:
+    """变更集本身的记账校验，返回新增对象映射（重复/冲突时不取首个之外的）。"""
+    add_nodes: dict[str, Node] = {}
+    for n in revision.add_nodes:
+        if n.id in nodes:
+            issues.append(
+                Issue(
+                    ADD_NODE_ID_EXISTS,
+                    f"新增节点编号已存在（如需修改请走更新）：{n.id}",
+                    node_id=n.id,
+                )
+            )
+        if n.id in add_nodes:
+            issues.append(
+                Issue(ADD_NODE_DUPLICATE, f"本次新增节点编号重复：{n.id}", node_id=n.id)
+            )
+        else:
+            add_nodes[n.id] = n
+
+    add_pipes: dict[str, Pipe] = {}
+    for p in revision.add_pipes:
+        if p.id in pipes:
+            issues.append(
+                Issue(
+                    ADD_PIPE_ID_EXISTS,
+                    f"新增管段编号已存在（如需修改请走更新）：{p.id}",
+                    pipe_id=p.id,
+                )
+            )
+        if p.id in add_pipes:
+            issues.append(
+                Issue(ADD_PIPE_DUPLICATE, f"本次新增管段编号重复：{p.id}", pipe_id=p.id)
+            )
+        else:
+            add_pipes[p.id] = p
+        # 新管段阀门默认开启：不允许在修订中直接置为关闭
+        if p.valve_closed:
+            issues.append(
+                Issue(
+                    NEW_PIPE_VALVE_CLOSED,
+                    f"新增管段 {p.id} 的阀门必须默认开启，不能在修订中关闭",
+                    pipe_id=p.id,
+                )
+            )
+
+    update_node_ids: set[str] = set()
+    for patch in revision.update_nodes:
+        if patch.id in update_node_ids:
+            issues.append(
+                Issue(
+                    CHANGE_TARGET_DUPLICATE,
+                    f"同一节点在本次变更中出现多次：{patch.id}",
+                    node_id=patch.id,
+                )
+            )
+        update_node_ids.add(patch.id)
+        if patch.id not in nodes:
+            issues.append(
+                Issue(
+                    UPDATE_NODE_NOT_FOUND,
+                    f"待更新节点不存在：{patch.id}",
+                    node_id=patch.id,
+                )
+            )
+
+    update_pipe_ids: set[str] = set()
+    for patch in revision.update_pipes:
+        if patch.id in update_pipe_ids:
+            issues.append(
+                Issue(
+                    CHANGE_TARGET_DUPLICATE,
+                    f"同一管段在本次变更中出现多次：{patch.id}",
+                    pipe_id=patch.id,
+                )
+            )
+        update_pipe_ids.add(patch.id)
+        if patch.id not in pipes:
+            issues.append(
+                Issue(
+                    UPDATE_PIPE_NOT_FOUND,
+                    f"待更新管段不存在：{patch.id}",
+                    pipe_id=patch.id,
+                )
+            )
+        # 现有阀位只能由隔离/复供流程改变
+        if patch.valve_closed is not UNCHANGED:
+            issues.append(
+                Issue(
+                    VALVE_STATE_IMMUTABLE,
+                    f"管段 {patch.id} 的阀位只能由隔离提交或复供确认改变，修订不得修改",
+                    pipe_id=patch.id,
+                )
+            )
+
+    delete_node_ids: set[str] = set()
+    for nid in revision.delete_node_ids:
+        if nid in delete_node_ids:
+            issues.append(
+                Issue(
+                    DELETE_NODE_DUPLICATE,
+                    f"本次删除节点编号重复：{nid}",
+                    node_id=nid,
+                )
+            )
+        delete_node_ids.add(nid)
+        if nid not in nodes:
+            issues.append(
+                Issue(
+                    DELETE_NODE_NOT_FOUND,
+                    f"待删除节点不存在：{nid}",
+                    node_id=nid,
+                )
+            )
+
+    delete_pipe_ids: set[str] = set()
+    for pid in revision.delete_pipe_ids:
+        if pid in delete_pipe_ids:
+            issues.append(
+                Issue(
+                    DELETE_PIPE_DUPLICATE,
+                    f"本次删除管段编号重复：{pid}",
+                    pipe_id=pid,
+                )
+            )
+        delete_pipe_ids.add(pid)
+        if pid not in pipes:
+            issues.append(
+                Issue(
+                    DELETE_PIPE_NOT_FOUND,
+                    f"待删除管段不存在：{pid}",
+                    pipe_id=pid,
+                )
+            )
+
+    # 同一对象不得在同一请求中既增/改又删
+    for nid in update_node_ids & delete_node_ids:
+        issues.append(
+            Issue(
+                CHANGE_TARGET_CONFLICT,
+                f"节点 {nid} 不能在同一次修订中既更新又删除",
+                node_id=nid,
+            )
+        )
+    for pid in update_pipe_ids & delete_pipe_ids:
+        issues.append(
+            Issue(
+                CHANGE_TARGET_CONFLICT,
+                f"管段 {pid} 不能在同一次修订中既更新又删除",
+                pipe_id=pid,
+            )
+        )
+    return add_nodes, add_pipes
+
+
+def _check_revision_protection(
+    revision: Revision,
+    protected_pipes: dict[str, list[IsolationEvent]],
+    protected_sinks: dict[str, list[IsolationEvent]],
+    issues: list[Issue],
+) -> None:
+    """待修复事件引用对象的保护检查（每个对象每类违约只报一次）。"""
+    node_patch_by_id = {p.id: p for p in revision.update_nodes}
+    pipe_patch_by_id = {p.id: p for p in revision.update_pipes}
+    delete_nodes = set(revision.delete_node_ids)
+    delete_pipes = set(revision.delete_pipe_ids)
+
+    def _event_refs(evts: list[IsolationEvent]) -> str:
+        return ", ".join(f"#{e.id}" for e in sorted(evts, key=lambda ev: ev.id))
+
+    for pid, evts in protected_pipes.items():
+        ref = _event_refs(evts)
+        if pid in delete_pipes:
+            issues.append(
+                Issue(
+                    PROTECTED_PIPE_DELETE,
+                    f"管段 {pid} 被待修复事件（{ref}）引用（故障管段或关阀管段），不得删除",
+                    pipe_id=pid,
+                    event_id=evts[0].id,
+                )
+            )
+        patch = pipe_patch_by_id.get(pid)
+        if patch is None:
+            continue
+        if patch.from_node is not UNCHANGED or patch.to_node is not UNCHANGED:
+            issues.append(
+                Issue(
+                    PROTECTED_PIPE_ENDPOINT_CHANGE,
+                    f"管段 {pid} 被待修复事件（{ref}）引用，其端点不得改动",
+                    pipe_id=pid,
+                    event_id=evts[0].id,
+                )
+            )
+        if patch.has_valve is not UNCHANGED:
+            issues.append(
+                Issue(
+                    PROTECTED_PIPE_VALVE_CHANGE,
+                    f"管段 {pid} 被待修复事件（{ref}）引用，其阀门属性不得改动",
+                    pipe_id=pid,
+                    event_id=evts[0].id,
+                )
+            )
+
+    for sid, evts in protected_sinks.items():
+        ref = _event_refs(evts)
+        if sid in delete_nodes:
+            issues.append(
+                Issue(
+                    PROTECTED_SINK_DELETE,
+                    f"用水点 {sid} 是待修复事件（{ref}）的失供用水点，不得删除",
+                    node_id=sid,
+                    event_id=evts[0].id,
+                )
+            )
+        patch = node_patch_by_id.get(sid)
+        if patch is not None and patch.type is not UNCHANGED:
+            issues.append(
+                Issue(
+                    PROTECTED_SINK_TYPE_CHANGE,
+                    f"用水点 {sid} 被待修复事件（{ref}）引用，其节点类型不得改动",
+                    node_id=sid,
+                    event_id=evts[0].id,
+                )
+            )
+
+
+def _apply_revision_to_snapshot(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    revision: Revision,
+) -> tuple[dict[str, Node], dict[str, Pipe]]:
+    """按“先删、再增/改”应用变更集，得到候选管网（不校验合法性）。"""
+    cand_nodes = dict(nodes)
+    cand_pipes = dict(pipes)
+
+    for nid in revision.delete_node_ids:
+        cand_nodes.pop(nid, None)
+    for pid in revision.delete_pipe_ids:
+        cand_pipes.pop(pid, None)
+
+    for n in revision.add_nodes:
+        cand_nodes[n.id] = n
+    for patch in revision.update_nodes:
+        cur = cand_nodes.get(patch.id)
+        if cur is None:
+            continue
+        cand_nodes[patch.id] = Node(
+            id=cur.id,
+            type=cur.type if patch.type is UNCHANGED else patch.type,
+            name=cur.name if patch.name is UNCHANGED else patch.name,
+        )
+
+    for p in revision.add_pipes:
+        # 新管段阀门默认开启：阀位永远以开启入库
+        cand_pipes[p.id] = Pipe(
+            id=p.id,
+            from_node=p.from_node,
+            to_node=p.to_node,
+            has_valve=p.has_valve,
+            valve_closed=False,
+            name=p.name,
+        )
+    for patch in revision.update_pipes:
+        cur = cand_pipes.get(patch.id)
+        if cur is None:
+            continue
+        cand_pipes[patch.id] = Pipe(
+            id=cur.id,
+            from_node=cur.from_node if patch.from_node is UNCHANGED else patch.from_node,
+            to_node=cur.to_node if patch.to_node is UNCHANGED else patch.to_node,
+            has_valve=cur.has_valve if patch.has_valve is UNCHANGED else patch.has_valve,
+            # 阀位不随修订变化（显式传 valve_closed 已在记账阶段判违规）
+            valve_closed=cur.valve_closed,
+            name=cur.name if patch.name is UNCHANGED else patch.name,
+        )
+
+    return cand_nodes, cand_pipes

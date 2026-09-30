@@ -5,7 +5,9 @@
 支持录入带编号的**水源(source)**、**用水点(sink)**、**连接点(junction)**及两端节点明确的**管段**（管段可设阀门）；
 针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**；
 隔离提交后生成带编号的隔离事件，操作员可按**事件编号 + 当前管网版本**进行
-**复供预演与确认**，安全地重新开阀、恢复供水。
+**复供预演与确认**，安全地重新开阀、恢复供水；
+现场测绘发现管网资料有误时，还可按**基准版本**对节点/管段做**局部增改删**，
+**不清空隔离事件**、原子生效。
 
 ---
 
@@ -103,6 +105,34 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   事件已复供（`409 EVENT_ALREADY_RESTORED`）、重新进水风险（`422 RESTORE_UNSAFE`）
   均明确拒绝，事务整体回滚，**不产生部分变更**。
 
+**局部修订（现场测绘纠错，`POST /api/network/revise`）**：
+
+- 不替换整网、**不清空任何隔离事件**（待修复事件继续生效），按基准版本做
+  增（`add_nodes`/`add_pipes`）、改（`update_nodes`/`update_pipes`）、
+  删（`delete_node_ids`/`delete_pipe_ids`）；每个变更都须**列明对象编号**。
+- 编号记账：新增编号不得与既有/本次编号重复（`ADD_*_ID_EXISTS`、`ADD_*_DUPLICATE`）；
+  更新/删除目标必须存在（`*_NOT_FOUND`）；删除列表不得重复（`DELETE_*_DUPLICATE`）；
+  同一对象不得在同次请求中出现多次、不得既更新又删除
+  （`CHANGE_TARGET_DUPLICATE`、`CHANGE_TARGET_CONFLICT`）。
+- **阀位规则**：新增管段的阀门**默认开启**，不得在修订中置关
+  （`NEW_PIPE_VALVE_CLOSED`）；现有 `valve_closed` **只能由隔离提交/复供确认改变**，
+  修订中给出该字段即拒绝（`VALVE_STATE_IMMUTABLE`）。
+- **候选管网结构校验**：在应用变更后的**完整候选管网**上执行与整网导入相同的校验
+  ——编号唯一、端点存在（拒绝悬空端点）、无自环、无阀管段不可关闭
+  （`DUPLICATE_*`、`PIPE_ENDPOINT_UNKNOWN`、`PIPE_SELF_LOOP`、`NON_VALVE_PIPE_CLOSED`）。
+- **待修复事件引用保护**：待修复事件引用的**故障管段、关阀管段、失供用水点不得删除**
+  （`PROTECTED_PIPE_DELETE`、`PROTECTED_SINK_DELETE`）；故障/关阀管段的**端点与阀门属性**、
+  失供用水点的**节点类型不得改动**（`PROTECTED_PIPE_ENDPOINT_CHANGE`、
+  `PROTECTED_PIPE_VALVE_CHANGE`、`PROTECTED_SINK_TYPE_CHANGE`）。
+  违约明细会给出涉及的对象编号与事件编号（`event_id`）。
+- **通水复核**：在“**当前关阀管段 ∪ 全部待修复故障管段**”断开的候选通水图上做 BFS，
+  每条待修复故障管段**两端仍须均不可从水源到达**；任一端重新可达即拒绝
+  （`422 PENDING_FAULT_REWATER`，携带事件与故障管段编号）。
+- 版本过期返回 `409 VERSION_CONFLICT`；以上任一违约或版本过期都**不写入**。
+- 成功时在**单个数据库事务**内：行级锁校验版本 → 增删改节点/管段（SQL 不触碰
+  `valve_closed` 列）→ 版本号 **+1** → 写修订流水（`network_revisions` 表），
+  原子返回**新版本号、修订流水号与全部变更编号**。整网导入会清空修订流水并从 1 重新累计。
+
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -110,6 +140,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | GET | `/health` | 健康检查 |
 | POST | `/api/network/import` | 整网导入（版本重置为 1，旧隔离事件失效） |
 | GET | `/api/network` | 读取当前管网与版本 |
+| POST | `/api/network/revise` | 局部修订（按基准版本增改删，保留隔离事件，原子版本 +1） |
 | POST | `/api/isolation/preview` | 隔离方案预演（只读，计入待修复故障管段） |
 | POST | `/api/isolation/submit` | 提交隔离（原子关阀 + 版本 +1） |
 | GET | `/api/isolation/events` | 隔离操作历史（含 `status`: pending/restored） |
@@ -335,17 +366,107 @@ python3 examples/demo.py http://localhost:8000
 
 脚本依次演示：导入 → 读取版本 → 不可行/可行预演 → 过期版本 409 → 成功提交 → 重复提交 409 → 重复关阀 422 → 历史。
 
+### 11. 局部修订（现场测绘纠错，标准库示例脚本）
+
+一键演示（建议先在有隔离事件的状态下运行，脚本会自行导入并提交一条待修复事件）：
+
+```bash
+python3 examples/revise_demo.py
+# 或指定地址：
+python3 examples/revise_demo.py http://localhost:8000
+```
+
+脚本依次演示：导入 → 提交待修复事件 #1（关 P4 隔离 P6，U3 失供）→
+合法局部修订（新增连接点 `E`、用水点 `U9`、新管段 `P9/P10`，新阀默认开启，
+并给 `U1` 改名；事件不清空，版本 +1，返回全部变更编号）→
+各类违约均被拒绝且不写入（保护对象删除/改动、旁通管致 `PENDING_FAULT_REWATER`、
+新管段置关、修订改阀位、自环/悬空端点、版本过期）→ 修订后正常复供。
+
+请求体（字段全部可选，至少给出一项增/改/删；`update_*` 中**省略的字段保持原值**，
+`name` 显式传 `null` 表示清空名称）：
+
+```json
+{
+  "version": 2,
+  "add_nodes": [
+    {"id": "E",  "type": "junction", "name": "现场补测连接点"},
+    {"id": "U9", "type": "sink",     "name": "新建小区"}
+  ],
+  "add_pipes": [
+    {"id": "P9",  "from": "A", "to": "E",  "has_valve": true,  "name": "现场补测管"},
+    {"id": "P10", "from": "E", "to": "U9", "has_valve": false}
+  ],
+  "update_nodes": [{"id": "U1", "name": "幸福小区（测绘更名）"}],
+  "update_pipes": [{"id": "P5", "name": "医院支管"}],
+  "delete_node_ids": [],
+  "delete_pipe_ids": []
+}
+```
+
+成功响应（原子更新管网、版本 +1，返回新版本与变更编号）：
+
+```json
+{
+  "version": 3,
+  "revision_no": 1,
+  "change_ids": [
+    {"op": "add_node",    "node_id": "E",  "pipe_id": null},
+    {"op": "add_node",    "node_id": "U9", "pipe_id": null},
+    {"op": "add_pipe",    "node_id": null, "pipe_id": "P9"},
+    {"op": "add_pipe",    "node_id": null, "pipe_id": "P10"},
+    {"op": "update_node", "node_id": "U1", "pipe_id": null}
+  ],
+  "change_count": 5,
+  "node_count": 9,
+  "pipe_count": 8
+}
+```
+
+`op` 取值：`add_node` / `add_pipe` / `update_node` / `update_pipe` /
+`delete_node` / `delete_pipe`。
+
+典型违约（均返回 `422 REVISION_INVALID`，`issues` 列明涉及对象/事件与原因，
+不写入任何数据）：
+
+- 删除待修复事件引用的故障管段/关阀管段 → `PROTECTED_PIPE_DELETE`；
+- 删除失供用水点 → `PROTECTED_SINK_DELETE`；改动其类型 → `PROTECTED_SINK_TYPE_CHANGE`；
+- 改动受保护管段端点 → `PROTECTED_PIPE_ENDPOINT_CHANGE`；改动阀门属性 → `PROTECTED_PIPE_VALVE_CHANGE`；
+- 新增旁通管使待修复故障管段任一端重新可达 → `PENDING_FAULT_REWATER`；
+- 新管段 `valve_closed:true` → `NEW_PIPE_VALVE_CLOSED`；
+  在 `update_pipes` 中给 `valve_closed` → `VALVE_STATE_IMMUTABLE`；
+- 候选管网自环/悬空端点/重号 → `PIPE_SELF_LOOP` / `PIPE_ENDPOINT_UNKNOWN` / `DUPLICATE_*`。
+
+版本过期返回 `409 VERSION_CONFLICT`，同样不写入。
+
+### 无数据库/依赖环境下的本地自测
+
+没有 Docker / PostgreSQL / FastAPI 时，可用标准库内存后端（复用同一份
+`app/planning.py` 领域逻辑与相同 HTTP 契约）跑通全部示例脚本，仅用于本地验证：
+
+```bash
+python3 tools/stdlib_server.py 8000        # 终端 A：启动内存后端
+python3 examples/revise_demo.py            # 终端 B：局部修订示例
+python3 examples/demo.py                   # 隔离流程示例
+python3 examples/restore_demo.py           # 复供流程示例
+```
+
+> 该内存后端不持久化、重启即清空，**不是生产部署方式**；生产仍用
+> `docker compose up --build`（FastAPI + PostgreSQL）。
+
 ## 七、测试
 
 核心图算法与校验逻辑（`tests/test_planning.py`，含隔离、待修复故障计入、
-复供安全性与阻断溯源共 24 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+复供安全性与阻断溯源共 24 个用例；`tests/test_revision.py`，含局部修订记账、
+候选管网结构校验、待修复事件引用保护与通水复核共 33 个用例）不依赖数据库与
+第三方库，可直接用标准库运行：
 
 ```bash
-python3 -m unittest tests.test_planning -v
+python3 -m unittest tests.test_planning tests.test_revision -v
 ```
 
 路由层集成测试（`tests/test_api.py`，含复供预演/确认、版本与状态拒绝、
-双故障复供顺序等）用内存替身替换数据库，覆盖完整 HTTP 契约，需先安装依赖：
+双故障复供顺序、局部修订成功/保护/重新进水/回滚等）用内存替身替换数据库，
+覆盖完整 HTTP 契约，需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -357,9 +478,10 @@ python3 -m unittest discover -s tests -v
 ```
 app/
   config.py       # 环境变量配置
-  schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离方案评估、复供安全性评估
-  db.py           # PostgreSQL：DDL、快照、整网导入、事务化隔离提交/复供确认、历史
+  schemas.py      # Pydantic 请求/响应模型（含局部修订 RevisionIn/Out）
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离方案评估、
+                  #   复供安全性评估、局部修订（记账/引用保护/候选网校验/通水复核）
+  db.py           # PostgreSQL：DDL、快照、整网导入、事务化隔离提交/复供确认/局部修订、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
@@ -367,8 +489,12 @@ examples/
   sample_restore_network.json  # 双故障复供示例管网
   demo.py                      # 隔离流程调用示例
   restore_demo.py              # 复供流程调用示例
+  revise_demo.py               # 局部修订（增改删）调用示例
+tools/
+  stdlib_server.py             # 标准库内存后端（无依赖时本地验证 HTTP 契约，非生产部署）
 tests/
   test_planning.py
+  test_revision.py
   test_api.py
 Dockerfile
 docker-compose.yml
