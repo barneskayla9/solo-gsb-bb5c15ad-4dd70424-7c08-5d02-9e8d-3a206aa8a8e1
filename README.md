@@ -5,7 +5,9 @@
 支持录入带编号的**水源(source)**、**用水点(sink)**、**连接点(junction)**及两端节点明确的**管段**（管段可设阀门）；
 针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**；
 隔离提交后生成带编号的隔离事件，操作员可按**事件编号 + 当前管网版本**进行
-**复供预演与确认**，安全地重新开阀、恢复供水。
+**复供预演与确认**，安全地重新开阀、恢复供水。现场测绘发现资料有误时，
+还可基于基准版本对节点/管段做**局部增改删**（保留隔离事件、阀位仅由
+隔离/复供流程改变），修订后自动复核待修复故障管段两端仍脱离水源。
 
 ---
 
@@ -103,6 +105,34 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   事件已复供（`409 EVENT_ALREADY_RESTORED`）、重新进水风险（`422 RESTORE_UNSAFE`）
   均明确拒绝，事务整体回滚，**不产生部分变更**。
 
+**现场测绘局部修订**（`POST /api/network/revision`，**不清空隔离事件**）：
+
+- 请求须携带基准 `version`，并按“新增 / 修改 / 删除”三类列明变更及对象编号：
+  `added_nodes` / `updated_nodes` / `deleted_node_ids` /
+  `added_pipes` / `updated_pipes` / `deleted_pipe_ids`（六类均可省略，省略视为空）。
+- **阀位只能由隔离、复供流程改变**：修订请求不允许改变阀位。新增管段的阀门
+  **默认开启**（`valve_closed=false`）；修改管段时阀位沿用当前真值。显式传
+  `valve_closed=true` 返回 `422 REVISION_VALVE_CLOSED_FORBIDDEN`。
+- 变更清单先自检：同一对象编号不得同时出现在多个变更中（`REVISION_DUPLICATE_CHANGE`）；
+  改/删对象必须已存在（`REVISION_NODE_NOT_FOUND` / `REVISION_PIPE_NOT_FOUND`）；
+  新增编号不得与现存编号冲突（`REVISION_ID_ALREADY_EXISTS`）。
+- 随后在**完整候选管网**上做结构校验：编号唯一、端点存在、无自环、无阀管段不可关闭
+  （复用整网导入的 `DUPLICATE_*` / `PIPE_*` / `NON_VALVE_PIPE_CLOSED` 明细）。
+- **待修复（pending）事件保护**（返回 `422 REVISION_INVALID`，issues 携带对象与事件编号）：
+  - 事件引用的**故障管段、关阀管段**不得删除（`PROTECTED_PIPE_DELETE_BY_EVENT`）；
+  - 事件的**失供用水点**不得删除（`PROTECTED_NODE_DELETE_BY_EVENT`）、
+    其**节点类型**不得改动（`PROTECTED_SINK_TYPE_CHANGE`）；
+  - 受保护管段的**端点**（`PROTECTED_PIPE_ENDPOINT_CHANGE`）与
+    **阀门属性 has_valve**（`PROTECTED_PIPE_VALVE_CHANGE`）不得改动；
+    其端点节点同样不得删除。
+  - 修改管段名称、给节点改名等非受限属性允许修订。
+- **修订后通水复核**：按“当前关闭的阀门 ∪ 全部待修复故障管段”断开通水图重新计算，
+  每条待修复故障管段**两端仍须均不可从水源到达**；任一端点重新可达即返回
+  `422 REVISION_FAULT_REACHABLE`（issues 给出事件编号、故障管段与可达端点）。
+- 任一校验/复核失败或版本过期（`409 VERSION_CONFLICT`）都**不写入**；
+  成功时在单个事务内原子增改删节点/管段并将版本号 +1，返回新版本与各变更编号清单。
+  整网导入接口的替换式语义（清空事件、版本重置为 1）保持不变。
+
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -110,6 +140,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | GET | `/health` | 健康检查 |
 | POST | `/api/network/import` | 整网导入（版本重置为 1，旧隔离事件失效） |
 | GET | `/api/network` | 读取当前管网与版本 |
+| POST | `/api/network/revision` | 局部增改删节点/管段（保留隔离事件，原子版本 +1） |
 | POST | `/api/isolation/preview` | 隔离方案预演（只读，计入待修复故障管段） |
 | POST | `/api/isolation/submit` | 提交隔离（原子关阀 + 版本 +1） |
 | GET | `/api/isolation/events` | 隔离操作历史（含 `status`: pending/restored） |
@@ -335,17 +366,111 @@ python3 examples/demo.py http://localhost:8000
 
 脚本依次演示：导入 → 读取版本 → 不可行/可行预演 → 过期版本 409 → 成功提交 → 重复提交 409 → 重复关阀 422 → 历史。
 
+### 11. 现场测绘局部修订
+
+现场测绘发现资料有误时，可基于**基准版本**对节点/管段局部增改删，
+**不清空隔离事件**。假设当前版本为 2，且事件 #1（关 P4 隔离 P6，U3 失供）仍待修复。
+
+**(a) 合法修订**：在水源侧 A 点新增用水点 U9 与带阀管段 P9，并给 U1 改名——
+不触碰隔离区，新管段阀门默认开启：
+
+```bash
+curl -s -X POST http://localhost:8000/api/network/revision \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 2,
+    "added_nodes": [{"id":"U9","type":"sink","name":"测绘新增用水点"}],
+    "added_pipes": [{"id":"P9","from":"A","to":"U9","has_valve":true}],
+    "updated_nodes": [{"id":"U1","type":"sink","name":"一区总表"}]
+  }'
+```
+
+成功响应（原子写入，版本 2 → 3，隔离事件原样保留）：
+
+```json
+{
+  "version": 3,
+  "added_node_ids": ["U9"],
+  "updated_node_ids": ["U1"],
+  "deleted_node_ids": [],
+  "added_pipe_ids": ["P9"],
+  "updated_pipe_ids": [],
+  "deleted_pipe_ids": [],
+  "node_count": 8,
+  "pipe_count": 7
+}
+```
+
+**(b) 删除待修复事件引用的故障管段 P6** → `422 REVISION_INVALID`，不写入：
+
+```bash
+curl -s -X POST http://localhost:8000/api/network/revision \
+  -H 'Content-Type: application/json' \
+  -d '{"version":2,"deleted_pipe_ids":["P6"]}'
+```
+
+```json
+{
+  "error": {
+    "code": "REVISION_INVALID",
+    "message": "管网局部修订被拒绝：……（整次修订不写入）",
+    "issues": [
+      {
+        "code": "PROTECTED_PIPE_DELETE_BY_EVENT",
+        "message": "管段 P6 被待修复事件 #1 引用（故障管段），修复复供前不得删除",
+        "pipe_id": "P6",
+        "event_id": 1
+      }
+    ]
+  }
+}
+```
+
+**(c) 修订破坏隔离**：新增绕过 P4 的无阀支路 A-D，会让故障管段 P6 的 D 端
+重新从水源到达 → `422 REVISION_FAULT_REACHABLE`，整次修订不写入：
+
+```bash
+curl -s -X POST http://localhost:8000/api/network/revision \
+  -H 'Content-Type: application/json' \
+  -d '{"version":2,"added_pipes":[{"id":"P9","from":"A","to":"D","has_valve":false}]}'
+```
+
+**(d) 其他常见拒绝**（均返回 `422 REVISION_INVALID`，不写入；版本错误为 `409`）：
+
+- 新增/修改管段显式 `"valve_closed": true` → `REVISION_VALVE_CLOSED_FORBIDDEN`
+  （阀位只能由隔离/复供改变，新管段阀门默认开启）；
+- 同一编号在一次请求里又增又删 → `REVISION_DUPLICATE_CHANGE`；
+- 新增编号与现存对象重号 → `REVISION_ID_ALREADY_EXISTS`；
+- 修改/删除不存在的对象 → `REVISION_NODE_NOT_FOUND` / `REVISION_PIPE_NOT_FOUND`；
+- 候选管网自环 / 悬空端点 / 重号 / 无阀关闭 →
+  `PIPE_SELF_LOOP` / `PIPE_ENDPOINT_UNKNOWN` / `DUPLICATE_*` / `NON_VALVE_PIPE_CLOSED`；
+- 改失供用水点类型 → `PROTECTED_SINK_TYPE_CHANGE`；
+  改受保护管段端点 / 阀门属性 →
+  `PROTECTED_PIPE_ENDPOINT_CHANGE` / `PROTECTED_PIPE_VALVE_CHANGE`；
+  删除失供用水点或受保护端点节点 → `PROTECTED_NODE_DELETE_BY_EVENT`；
+- `version` 不等于当前版本 → `409 VERSION_CONFLICT`（携带 `current_version`）。
+
+一键演示（覆盖上述全部拒绝路径与成功路径，标准库实现）：
+
+```bash
+python3 examples/revision_demo.py
+# 或指定地址：
+python3 examples/revision_demo.py http://localhost:8000
+```
+
 ## 七、测试
 
 核心图算法与校验逻辑（`tests/test_planning.py`，含隔离、待修复故障计入、
-复供安全性与阻断溯源共 24 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+复供安全性与阻断溯源、局部修订校验/保护/通水复核）不依赖数据库与第三方库，
+可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
 路由层集成测试（`tests/test_api.py`，含复供预演/确认、版本与状态拒绝、
-双故障复供顺序等）用内存替身替换数据库，覆盖完整 HTTP 契约，需先安装依赖：
+双故障复供顺序、局部修订成功/保护/通水复核等）用内存替身替换数据库，
+覆盖完整 HTTP 契约，需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -358,8 +483,8 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离方案评估、复供安全性评估
-  db.py           # PostgreSQL：DDL、快照、整网导入、事务化隔离提交/复供确认、历史
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离方案评估、复供安全性评估、局部修订校验与通水复核
+  db.py           # PostgreSQL：DDL、快照、整网导入、事务化隔离提交/复供确认/局部修订、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
@@ -367,6 +492,7 @@ examples/
   sample_restore_network.json  # 双故障复供示例管网
   demo.py                      # 隔离流程调用示例
   restore_demo.py              # 复供流程调用示例
+  revision_demo.py             # 局部管网修订调用示例
 tests/
   test_planning.py
   test_api.py

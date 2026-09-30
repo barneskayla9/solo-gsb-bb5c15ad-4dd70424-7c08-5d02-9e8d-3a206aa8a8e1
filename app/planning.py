@@ -40,6 +40,22 @@ PIPE_SELF_LOOP = "PIPE_SELF_LOOP"
 PIPE_ENDPOINT_UNKNOWN = "PIPE_ENDPOINT_UNKNOWN"
 NON_VALVE_PIPE_CLOSED = "NON_VALVE_PIPE_CLOSED"
 
+# 局部修订：变更清单本身的问题（422 REVISION_INVALID）
+REVISION_DUPLICATE_CHANGE = "REVISION_DUPLICATE_CHANGE"
+REVISION_NODE_NOT_FOUND = "REVISION_NODE_NOT_FOUND"
+REVISION_PIPE_NOT_FOUND = "REVISION_PIPE_NOT_FOUND"
+REVISION_ID_ALREADY_EXISTS = "REVISION_ID_ALREADY_EXISTS"
+# 新增/修改管段时不得通过修订改变阀位（阀位只能由隔离/复供流程改变）
+REVISION_VALVE_CLOSED_FORBIDDEN = "REVISION_VALVE_CLOSED_FORBIDDEN"
+# 局部修订：待修复事件保护（422 REVISION_INVALID）
+PROTECTED_PIPE_DELETE_BY_EVENT = "PROTECTED_PIPE_DELETE_BY_EVENT"
+PROTECTED_NODE_DELETE_BY_EVENT = "PROTECTED_NODE_DELETE_BY_EVENT"
+PROTECTED_PIPE_ENDPOINT_CHANGE = "PROTECTED_PIPE_ENDPOINT_CHANGE"
+PROTECTED_PIPE_VALVE_CHANGE = "PROTECTED_PIPE_VALVE_CHANGE"
+PROTECTED_SINK_TYPE_CHANGE = "PROTECTED_SINK_TYPE_CHANGE"
+# 局部修订：修订后通水复核失败（待修复故障管段端点重新可达）
+REVISION_FAULT_REACHABLE = "REVISION_FAULT_REACHABLE"
+
 # 隔离事件状态
 EVENT_PENDING = "pending"      # 待修复
 EVENT_RESTORED = "restored"    # 已复供
@@ -81,6 +97,8 @@ class Issue:
     # 可选的附加引用：阻断用水点的待修复事件 / 具体管段编号
     event_id: int | None = None
     related_pipe_id: str | None = None
+    # 涉及的节点编号（节点类问题；保持在末尾以向后兼容旧的构造方式）
+    node_id: str | None = None
 
     def as_dict(self) -> dict:
         d = {"code": self.code, "message": self.message, "pipe_id": self.pipe_id}
@@ -88,6 +106,8 @@ class Issue:
             d["event_id"] = self.event_id
         if self.related_pipe_id is not None:
             d["related_pipe_id"] = self.related_pipe_id
+        if self.node_id is not None:
+            d["node_id"] = self.node_id
         return d
 
 
@@ -503,4 +523,400 @@ def evaluate_restoration(
         issues=issues,
         remaining_closed_pipe_ids=sorted(remaining_closed),
         remaining_fault_pipe_ids=sorted(pending_fault_ids),
+    )
+
+
+# ---------------------------------------------------------------- 局部管网修订
+#
+# 现场测绘发现资料有误时，操作员基于基准版本对节点/管段做局部增改删，
+# 不清空隔离事件。阀位只能由隔离、复供流程改变，因此：
+#   - 修订不接受 valve_closed：新增管段的阀门默认开启（valve_closed=False）；
+#   - 修改管段时阀位沿用当前真值；
+#   - 待修复事件引用的故障管段、关阀管段、失供用水点受保护，不得删除，
+#     其管段端点、阀门属性及用水点类型不得改动。
+# 修订后须按“当前关阀 ∪ 待修复故障管段”断开的通水图复核：每条待修复
+# 故障管段两端仍须均不可从水源到达，否则整次修订拒绝（不写入）。
+
+
+@dataclass(frozen=True)
+class NodeChange:
+    """一次节点新增/修改。"""
+
+    id: str
+    type: str  # source / sink / junction
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class PipeChange:
+    """一次管段新增/修改。
+
+    valve_closed 仅用于识别调用方是否显式传入 true：
+    显式 true 一律拒绝；None 表示未提供。修订成功后：
+    新增管段阀位为 False，修改管段阀位沿用旧真值。
+    """
+
+    id: str
+    from_node: str
+    to_node: str
+    has_valve: bool = False
+    valve_closed: bool | None = None
+    name: str | None = None
+
+
+@dataclass
+class RevisionCheck:
+    """局部修订的校验与复核结果。
+
+    valid=True 时 new_nodes/new_pipes 为应用变更后的完整候选管网，
+    可直接交给持久层原子写入；valid=False 时 issues 给出全部违约明细。
+    """
+
+    valid: bool
+    issues: list[Issue]
+    new_nodes: dict[str, Node] = field(default_factory=dict)
+    new_pipes: dict[str, Pipe] = field(default_factory=dict)
+    added_node_ids: list[str] = field(default_factory=list)
+    updated_node_ids: list[str] = field(default_factory=list)
+    deleted_node_ids: list[str] = field(default_factory=list)
+    added_pipe_ids: list[str] = field(default_factory=list)
+    updated_pipe_ids: list[str] = field(default_factory=list)
+    deleted_pipe_ids: list[str] = field(default_factory=list)
+
+    @property
+    def change_ids(self) -> dict[str, list[str]]:
+        return {
+            "added_node_ids": list(self.added_node_ids),
+            "updated_node_ids": list(self.updated_node_ids),
+            "deleted_node_ids": list(self.deleted_node_ids),
+            "added_pipe_ids": list(self.added_pipe_ids),
+            "updated_pipe_ids": list(self.updated_pipe_ids),
+            "deleted_pipe_ids": list(self.deleted_pipe_ids),
+        }
+
+
+def _pending(events: list[IsolationEvent] | None) -> list[IsolationEvent]:
+    return [e for e in (events or []) if e.status == EVENT_PENDING]
+
+
+def check_revision(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    *,
+    added_nodes: list[NodeChange],
+    updated_nodes: list[NodeChange],
+    deleted_node_ids: list[str],
+    added_pipes: list[PipeChange],
+    updated_pipes: list[PipeChange],
+    deleted_pipe_ids: list[str],
+    pending_events: list[IsolationEvent] | None = None,
+) -> RevisionCheck:
+    """校验局部修订并构建修订后的完整候选管网。
+
+    分阶段执行，任一阶段存在问题即短路返回（issues 携带对象/事件编号与原因）：
+      1. 变更清单语义：同一对象编号不得出现多个变更；改/删对象必须已存在，
+         新增编号不得与现存编号冲突；
+      2. 待修复事件保护：故障管段、关阀管段、失供用水点不得删除；
+         管段端点、阀门属性、用水点类型不得改动；
+      3. 完整候选管网结构校验：编号唯一、端点存在、无自环、无阀管段不可关闭
+         （复用整网导入校验）；
+      4. 通水复核：按当前关阀与待修复故障管段断开后，每条待修复故障管段
+         两端仍须均不可从水源到达。
+    """
+    issues: list[Issue] = []
+
+    # ---- 1. 变更清单语义 ------------------------------------------------
+    node_buckets = (
+        ("add", added_nodes, lambda c: c.id),
+        ("update", updated_nodes, lambda c: c.id),
+        ("delete", deleted_node_ids, lambda x: x),
+    )
+    pipe_buckets = (
+        ("add", added_pipes, lambda c: c.id),
+        ("update", updated_pipes, lambda c: c.id),
+        ("delete", deleted_pipe_ids, lambda x: x),
+    )
+
+    def collect(buckets):
+        where: dict[str, list[str]] = {}
+        for label, items, keyof in buckets:
+            for item in items:
+                where.setdefault(keyof(item), []).append(label)
+        return where
+
+    node_where = collect(node_buckets)
+    pipe_where = collect(pipe_buckets)
+
+    for nid, labels in sorted(node_where.items()):
+        if len(labels) > 1:
+            issues.append(
+                Issue(
+                    REVISION_DUPLICATE_CHANGE,
+                    f"节点 {nid} 在同一次修订中出现多个变更：{'/'.join(labels)}",
+                    node_id=nid,
+                )
+            )
+    for pid, labels in sorted(pipe_where.items()):
+        if len(labels) > 1:
+            issues.append(
+                Issue(
+                    REVISION_DUPLICATE_CHANGE,
+                    f"管段 {pid} 在同一次修订中出现多个变更：{'/'.join(labels)}",
+                    pipe_id=pid,
+                )
+            )
+
+    for c in added_nodes:
+        if len(node_where[c.id]) == 1 and c.id in nodes:
+            issues.append(
+                Issue(
+                    REVISION_ID_ALREADY_EXISTS,
+                    f"新增节点编号已存在：{c.id}",
+                    node_id=c.id,
+                )
+            )
+    for c in updated_nodes:
+        if len(node_where[c.id]) == 1 and c.id not in nodes:
+            issues.append(
+                Issue(REVISION_NODE_NOT_FOUND, f"待修改节点不存在：{c.id}", node_id=c.id)
+            )
+    for nid in deleted_node_ids:
+        if len(node_where[nid]) == 1 and nid not in nodes:
+            issues.append(
+                Issue(REVISION_NODE_NOT_FOUND, f"待删除节点不存在：{nid}", node_id=nid)
+            )
+
+    for c in added_pipes:
+        if len(pipe_where[c.id]) == 1 and c.id in pipes:
+            issues.append(
+                Issue(
+                    REVISION_ID_ALREADY_EXISTS,
+                    f"新增管段编号已存在：{c.id}",
+                    pipe_id=c.id,
+                )
+            )
+        if c.valve_closed is True:
+            issues.append(
+                Issue(
+                    REVISION_VALVE_CLOSED_FORBIDDEN,
+                    f"新增管段 {c.id} 的阀门默认开启，不能在修订中标记为关闭；"
+                    "阀位只能由隔离/复供流程改变",
+                    pipe_id=c.id,
+                )
+            )
+    for c in updated_pipes:
+        if len(pipe_where[c.id]) == 1 and c.id not in pipes:
+            issues.append(
+                Issue(REVISION_PIPE_NOT_FOUND, f"待修改管段不存在：{c.id}", pipe_id=c.id)
+            )
+        if c.valve_closed is True:
+            issues.append(
+                Issue(
+                    REVISION_VALVE_CLOSED_FORBIDDEN,
+                    f"管段 {c.id} 的阀位只能由隔离/复供流程改变，不能在修订中关闭",
+                    pipe_id=c.id,
+                )
+            )
+    for pid in deleted_pipe_ids:
+        if len(pipe_where[pid]) == 1 and pid not in pipes:
+            issues.append(
+                Issue(REVISION_PIPE_NOT_FOUND, f"待删除管段不存在：{pid}", pipe_id=pid)
+            )
+
+    if issues:
+        return RevisionCheck(valid=False, issues=issues)
+
+    # ---- 2. 待修复事件保护 ----------------------------------------------
+    pending = _pending(pending_events)
+    # 受保护端点节点 -> 首个引用它的事件编号（用于给出事件引用）
+    protected_node_events: dict[str, int] = {}
+
+    for event in pending:
+        fault = pipes.get(event.fault_pipe_id)
+        if fault is not None:
+            for end in (fault.from_node, fault.to_node):
+                protected_node_events.setdefault(end, event.id)
+
+        # 故障管段 / 关阀管段：不得删除
+        for pid in (*event.closed_pipe_ids, event.fault_pipe_id):
+            if pid in deleted_pipe_ids:
+                issues.append(
+                    Issue(
+                        PROTECTED_PIPE_DELETE_BY_EVENT,
+                        f"管段 {pid} 被待修复事件 #{event.id} 引用"
+                        f"（{'关阀管段' if pid in event.closed_pipe_ids else '故障管段'}），"
+                        "修复复供前不得删除",
+                        pipe_id=pid,
+                        event_id=event.id,
+                    )
+                )
+            new = next((c for c in updated_pipes if c.id == pid), None)
+            if new is not None:
+                old = pipes.get(pid)
+                if old is not None:
+                    if {old.from_node, old.to_node} != {new.from_node, new.to_node}:
+                        issues.append(
+                            Issue(
+                                PROTECTED_PIPE_ENDPOINT_CHANGE,
+                                f"管段 {pid} 被待修复事件 #{event.id} 引用，"
+                                f"其端点不得由 {old.from_node}-{old.to_node} "
+                                f"改为 {new.from_node}-{new.to_node}",
+                                pipe_id=pid,
+                                event_id=event.id,
+                            )
+                        )
+                    if old.has_valve != new.has_valve:
+                        issues.append(
+                            Issue(
+                                PROTECTED_PIPE_VALVE_CHANGE,
+                                f"管段 {pid} 被待修复事件 #{event.id} 引用，"
+                                f"其阀门属性不得由 has_valve={old.has_valve} "
+                                f"改为 has_valve={new.has_valve}",
+                                pipe_id=pid,
+                                event_id=event.id,
+                            )
+                        )
+
+        # 失供用水点：不得删除、类型不得改动
+        for sink_id in event.affected_sink_ids:
+            if sink_id in deleted_node_ids:
+                issues.append(
+                    Issue(
+                        PROTECTED_NODE_DELETE_BY_EVENT,
+                        f"用水点 {sink_id} 是待修复事件 #{event.id} 的失供用水点，"
+                        "修复复供前不得删除",
+                        node_id=sink_id,
+                        event_id=event.id,
+                        related_pipe_id=event.fault_pipe_id,
+                    )
+                )
+            new_node = next((c for c in updated_nodes if c.id == sink_id), None)
+            old_node = nodes.get(sink_id)
+            if new_node is not None and old_node is not None and new_node.type != old_node.type:
+                issues.append(
+                    Issue(
+                        PROTECTED_SINK_TYPE_CHANGE,
+                        f"用水点 {sink_id} 是待修复事件 #{event.id} 的失供用水点，"
+                        f"其类型不得由 {old_node.type} 改为 {new_node.type}",
+                        node_id=sink_id,
+                        event_id=event.id,
+                        related_pipe_id=event.fault_pipe_id,
+                    )
+                )
+
+    # 受保护管段（故障/关阀）的端点节点不得删除，否则会悬空或改变引用拓扑。
+    # 已作为失供用水点上报的节点不重复上报。
+    sink_delete_events = {
+        nid
+        for nid in deleted_node_ids
+        if any(nid in event.affected_sink_ids for event in pending)
+    }
+    for nid in deleted_node_ids:
+        if nid in protected_node_events and nid not in sink_delete_events:
+            issues.append(
+                Issue(
+                    PROTECTED_NODE_DELETE_BY_EVENT,
+                    f"节点 {nid} 是待修复事件 #{protected_node_events[nid]} 引用的"
+                    "故障/关阀管段端点，修复复供前不得删除",
+                    node_id=nid,
+                    event_id=protected_node_events[nid],
+                )
+            )
+
+    if issues:
+        return RevisionCheck(valid=False, issues=issues)
+
+    # ---- 3. 应用变更，构建完整候选管网 ----------------------------------
+    new_nodes = dict(nodes)
+    for nid in deleted_node_ids:
+        new_nodes.pop(nid, None)
+    for c in (*added_nodes, *updated_nodes):
+        new_nodes[c.id] = Node(id=c.id, type=c.type, name=c.name)
+
+    new_pipes = dict(pipes)
+    for pid in deleted_pipe_ids:
+        new_pipes.pop(pid, None)
+    for c in added_pipes:
+        # 新增管段阀门默认开启
+        new_pipes[c.id] = Pipe(
+            id=c.id,
+            from_node=c.from_node,
+            to_node=c.to_node,
+            has_valve=c.has_valve,
+            valve_closed=False,
+            name=c.name,
+        )
+    for c in updated_pipes:
+        old = pipes[c.id]
+        # 修改管段不改变阀位真值（阀位只能由隔离/复供流程改变）；
+        # 去掉阀门后 valve_closed 规范为 False（结构校验同样会拒绝
+        # “无阀且关闭”的候选，二者保持一致）
+        new_pipes[c.id] = Pipe(
+            id=c.id,
+            from_node=c.from_node,
+            to_node=c.to_node,
+            has_valve=c.has_valve,
+            valve_closed=bool(old.valve_closed and c.has_valve),
+            name=c.name,
+        )
+
+    structure_issues = validate_import(
+        list(new_nodes.values()), list(new_pipes.values())
+    )
+    if structure_issues:
+        return RevisionCheck(valid=False, issues=structure_issues)
+
+    # ---- 4. 修订后通水复核 ----------------------------------------------
+    # 断开通水图 = 当前关闭的阀门 ∪ 待修复故障管段。
+    removed = frozenset(
+        p.id for p in new_pipes.values() if p.has_valve and p.valve_closed
+    ) | frozenset(e.fault_pipe_id for e in pending)
+    reachable = _reachable(new_nodes, list(new_pipes.values()), removed)
+
+    seen_faults: set[str] = set()
+    for event in pending:
+        fid = event.fault_pipe_id
+        if fid in seen_faults:
+            continue
+        seen_faults.add(fid)
+        fault = new_pipes.get(fid)
+        if fault is None:
+            # 理论上不会发生（第 2 阶段已拦截删除），仍显式拒绝以防部分状态
+            issues.append(
+                Issue(
+                    PROTECTED_PIPE_DELETE_BY_EVENT,
+                    f"待修复事件 #{event.id} 的故障管段 {fid} 在修订后不存在",
+                    pipe_id=fid,
+                    event_id=event.id,
+                )
+            )
+            continue
+        reachable_ends = [
+            end for end in (fault.from_node, fault.to_node) if end in reachable
+        ]
+        if reachable_ends:
+            issues.append(
+                Issue(
+                    REVISION_FAULT_REACHABLE,
+                    f"修订后待修复事件 #{event.id} 的故障管段 {fid} 的端点 "
+                    f"{sorted(reachable_ends)} 可从水源到达，隔离被破坏，禁止修订",
+                    pipe_id=fid,
+                    event_id=event.id,
+                )
+            )
+
+    if issues:
+        return RevisionCheck(valid=False, issues=issues)
+
+    return RevisionCheck(
+        valid=True,
+        issues=[],
+        new_nodes=new_nodes,
+        new_pipes=new_pipes,
+        added_node_ids=sorted(c.id for c in added_nodes),
+        updated_node_ids=sorted(c.id for c in updated_nodes),
+        deleted_node_ids=sorted(deleted_node_ids),
+        added_pipe_ids=sorted(c.id for c in added_pipes),
+        updated_pipe_ids=sorted(c.id for c in updated_pipes),
+        deleted_pipe_ids=sorted(deleted_pipe_ids),
     )

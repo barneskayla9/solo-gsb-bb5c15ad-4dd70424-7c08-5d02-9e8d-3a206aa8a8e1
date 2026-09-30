@@ -55,6 +55,40 @@ class RestoreIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号")
 
 
+# ---------------------------------------------------------------- 局部修订
+
+
+class PipeRevisionIn(BaseModel):
+    """局部修订中的新增/修改管段。
+
+    与整网导入不同：修订不允许改变阀位 —— 新管段阀门默认开启，
+    既有管段阀位只能由隔离/复供流程改变。显式传 valve_closed=true
+    会在业务校验阶段以 REVISION_VALVE_CLOSED_FORBIDDEN 拒绝（携带管段编号）；
+    省略或传 false 均按“不改变阀位”处理。
+    """
+
+    id: str = Field(min_length=1, description="管段编号，唯一")
+    from_node: str = Field(min_length=1, validation_alias="from")
+    to_node: str = Field(min_length=1, validation_alias="to")
+    has_valve: bool = Field(default=False, description="该管段是否设有阀门")
+    valve_closed: bool = Field(default=False, description="修订不允许改变阀位；传 true 将被拒绝")
+    name: str | None = None
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+
+class RevisionIn(BaseModel):
+    """局部管网修订入参：基于基准版本对节点/管段做增改删，不清空隔离事件。"""
+
+    version: int = Field(ge=0, description="修订所基于的基准管网版本号")
+    added_nodes: list[NodeIn] = Field(default_factory=list)
+    updated_nodes: list[NodeIn] = Field(default_factory=list)
+    deleted_node_ids: list[str] = Field(default_factory=list)
+    added_pipes: list[PipeRevisionIn] = Field(default_factory=list)
+    updated_pipes: list[PipeRevisionIn] = Field(default_factory=list)
+    deleted_pipe_ids: list[str] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -94,6 +128,8 @@ class IssueOut(BaseModel):
     # 复供阻断原因可能引用具体待修复事件与相关管段（可选，保持向后兼容）
     event_id: int | None = None
     related_pipe_id: str | None = None
+    # 局部修订的节点类问题携带节点编号
+    node_id: str | None = None
 
 
 class PreviewOut(BaseModel):
@@ -152,3 +188,17 @@ class EventOut(BaseModel):
     restored_version: int | None = None
     reopened_pipe_ids: list[str] = []
     created_at: datetime
+
+
+class RevisionOut(BaseModel):
+    """局部修订成功响应：新版本 + 实际生效的变更对象编号。"""
+
+    version: int
+    added_node_ids: list[str] = []
+    updated_node_ids: list[str] = []
+    deleted_node_ids: list[str] = []
+    added_pipe_ids: list[str] = []
+    updated_pipe_ids: list[str] = []
+    deleted_pipe_ids: list[str] = []
+    node_count: int
+    pipe_count: int

@@ -4,6 +4,7 @@
 - GET  /health                         健康检查
 - POST /api/network/import             整网导入（替换式，版本重置为 1）
 - GET  /api/network                    读取当前管网与版本
+- POST /api/network/revision           基于基准版本局部增改删节点/管段（保留隔离事件，版本 +1）
 - POST /api/isolation/preview          隔离方案预演（只读）
 - POST /api/isolation/submit           提交隔离（原子关阀 + 版本 +1）
 - GET  /api/isolation/events           隔离操作历史（区分待修复/已复供）
@@ -20,10 +21,13 @@ from .config import get_settings
 from .planning import (
     Node,
     Pipe,
+    NodeChange,
+    PipeChange,
     RESTORE_REWATER_RISK,
     evaluate_plan,
     evaluate_restoration,
     validate_import,
+    check_revision,
     BLOCKING_ISSUE_CODES,
 )
 from .db import to_domain_event
@@ -31,12 +35,14 @@ from .schemas import (
     ImportIn,
     PlanIn,
     RestoreIn,
+    RevisionIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
     SubmitOut,
     RestorePreviewOut,
     RestoreConfirmOut,
+    RevisionOut,
     EventOut,
 )
 from .serializers import serialize_preview, serialize_restore_preview, serialize_snapshot
@@ -59,7 +65,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -175,6 +181,78 @@ def get_network():
     with db.get_conn() as conn:
         version, updated_at, nodes, pipes = db.load_snapshot(conn)
     return serialize_snapshot(version, updated_at, nodes, pipes)
+
+
+def _to_node_change(n) -> NodeChange:
+    return NodeChange(id=n.id, type=n.type, name=n.name)
+
+
+def _to_pipe_change(p) -> PipeChange:
+    return PipeChange(
+        id=p.id,
+        from_node=p.from_node,
+        to_node=p.to_node,
+        has_valve=p.has_valve,
+        valve_closed=True if p.valve_closed else None,
+        name=p.name,
+    )
+
+
+@app.post(
+    "/api/network/revision",
+    response_model=RevisionOut,
+    tags=["管网"],
+    summary="局部修订：基于基准版本增改删节点/管段，保留隔离事件，原子版本 +1",
+)
+def revise_network(payload: RevisionIn):
+    added_nodes = [_to_node_change(n) for n in payload.added_nodes]
+    updated_nodes = [_to_node_change(n) for n in payload.updated_nodes]
+    added_pipes = [_to_pipe_change(p) for p in payload.added_pipes]
+    updated_pipes = [_to_pipe_change(p) for p in payload.updated_pipes]
+
+    with db.transaction() as conn:
+        # 锁定版本行后基于最新快照校验，保证“校验—写入”期间没有并发改动
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn, for_update=True)
+        if version != payload.version:
+            raise db.VersionConflict(version, payload.version)
+
+        pending_events = _load_pending_domain_events(conn)
+
+        check = check_revision(
+            nodes,
+            pipes,
+            added_nodes=added_nodes,
+            updated_nodes=updated_nodes,
+            deleted_node_ids=list(payload.deleted_node_ids),
+            added_pipes=added_pipes,
+            updated_pipes=updated_pipes,
+            deleted_pipe_ids=list(payload.deleted_pipe_ids),
+            pending_events=pending_events,
+        )
+        if not check.valid:
+            # 结构/保护/通水复核违约：连同待修复事件编号与对象编号一并返回
+            code = (
+                "REVISION_FAULT_REACHABLE"
+                if any(i.code == "REVISION_FAULT_REACHABLE" for i in check.issues)
+                else "REVISION_INVALID"
+            )
+            raise ApiError(
+                422,
+                code,
+                "管网局部修订被拒绝：变更非法、触碰待修复事件保护，"
+                "或修订后待修复故障管段端点可重新从水源到达（整次修订不写入）",
+                issues=check.issues,
+            )
+
+        outcome = db.apply_revision(conn, expected_version=payload.version, check=check)
+
+    body = {
+        "version": outcome["version"],
+        "node_count": outcome["node_count"],
+        "pipe_count": outcome["pipe_count"],
+    }
+    body.update(check.change_ids)
+    return body
 
 
 # ---------------------------------------------------------------- 隔离

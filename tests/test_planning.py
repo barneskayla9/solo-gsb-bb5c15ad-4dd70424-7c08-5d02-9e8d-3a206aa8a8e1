@@ -383,5 +383,224 @@ class RestorationTests(unittest.TestCase):
         self.assertEqual(result.recoverable_sink_ids, ["U1", "U2"])
 
 
+class RevisionCheckTests(unittest.TestCase):
+    """局部修订 check_revision 的纯领域测试。"""
+
+    def setUp(self):
+        self.nodes, self.pipes = build_demo()
+
+    def _check(self, **kw):
+        from app.planning import check_revision, NodeChange, PipeChange
+
+        kw.setdefault("added_nodes", [])
+        kw.setdefault("updated_nodes", [])
+        kw.setdefault("deleted_node_ids", [])
+        kw.setdefault("added_pipes", [])
+        kw.setdefault("updated_pipes", [])
+        kw.setdefault("deleted_pipe_ids", [])
+        kw.setdefault("pending_events", [])
+        return check_revision(self.nodes, self.pipes, **kw)
+
+    def test_add_branch_valid_new_valve_open(self):
+        from app.planning import NodeChange, PipeChange
+
+        result = self._check(
+            added_nodes=[NodeChange("U9", "sink")],
+            added_pipes=[PipeChange("P9", "D", "U9", has_valve=True)],
+        )
+        self.assertTrue(result.valid, [i.code for i in result.issues])
+        self.assertFalse(result.new_pipes["P9"].valve_closed)
+        self.assertEqual(result.added_pipe_ids, ["P9"])
+
+    def test_duplicate_change_same_id(self):
+        from app.planning import NodeChange
+
+        result = self._check(
+            added_nodes=[NodeChange("X", "junction")], deleted_node_ids=["X"]
+        )
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "REVISION_DUPLICATE_CHANGE")
+        self.assertEqual(result.issues[0].node_id, "X")
+
+    def test_add_existing_and_update_missing(self):
+        from app.planning import NodeChange, PipeChange
+
+        result = self._check(
+            added_nodes=[NodeChange("A", "junction")],
+            updated_pipes=[PipeChange("P404", "S", "A")],
+            deleted_pipe_ids=["P505"],
+        )
+        codes = {i.code for i in result.issues}
+        self.assertEqual(
+            codes,
+            {"REVISION_ID_ALREADY_EXISTS", "REVISION_PIPE_NOT_FOUND"},
+        )
+
+    def test_new_pipe_closed_forbidden(self):
+        from app.planning import PipeChange
+
+        result = self._check(
+            added_pipes=[PipeChange("P9", "A", "D", has_valve=True, valve_closed=True)]
+        )
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "REVISION_VALVE_CLOSED_FORBIDDEN")
+
+    def test_structure_self_loop_and_dangling(self):
+        from app.planning import PipeChange
+
+        result = self._check(
+            added_pipes=[
+                PipeChange("P9", "D", "D"),
+                PipeChange("P10", "D", "GHOST"),
+            ]
+        )
+        codes = {i.code for i in result.issues}
+        self.assertIn("PIPE_SELF_LOOP", codes)
+        self.assertIn("PIPE_ENDPOINT_UNKNOWN", codes)
+
+    def test_update_pipe_keeps_existing_valve_state(self):
+        from app.planning import PipeChange
+
+        # P4 当前有阀且未关；改名并保留阀门 -> 阀位沿用 False
+        result = self._check(
+            updated_pipes=[PipeChange("P4", "B", "D", has_valve=True, name="新P4")]
+        )
+        self.assertTrue(result.valid, [i.code for i in result.issues])
+        self.assertFalse(result.new_pipes["P4"].valve_closed)
+        self.assertEqual(result.new_pipes["P4"].name, "新P4")
+
+    def _pending_event(self):
+        # 事件 #1：关 P4 隔离 P6，U3 失供
+        return IsolationEvent(
+            1, "P6", ("P4",), affected_sink_ids=("U3",),
+            version_before=1, version_after=2,
+        )
+
+    def test_protected_pipe_delete(self):
+        result = self._check(deleted_pipe_ids=["P6"], pending_events=[self._pending_event()])
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "PROTECTED_PIPE_DELETE_BY_EVENT")
+        self.assertEqual(result.issues[0].event_id, 1)
+
+    def test_protected_closed_pipe_delete(self):
+        result = self._check(deleted_pipe_ids=["P4"], pending_events=[self._pending_event()])
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "PROTECTED_PIPE_DELETE_BY_EVENT")
+
+    def test_protected_endpoint_change_and_valve_change(self):
+        from app.planning import PipeChange
+
+        result = self._check(
+            updated_pipes=[PipeChange("P6", "B", "U3", has_valve=False)],
+            pending_events=[self._pending_event()],
+        )
+        codes = {i.code for i in result.issues}
+        self.assertIn("PROTECTED_PIPE_ENDPOINT_CHANGE", codes)
+
+        result = self._check(
+            updated_pipes=[PipeChange("P4", "B", "D", has_valve=False)],
+            pending_events=[self._pending_event()],
+        )
+        codes = {i.code for i in result.issues}
+        self.assertIn("PROTECTED_PIPE_VALVE_CHANGE", codes)
+
+    def test_protected_sink_delete_and_type_change(self):
+        from app.planning import NodeChange
+
+        result = self._check(
+            deleted_node_ids=["U3"], pending_events=[self._pending_event()]
+        )
+        self.assertEqual(result.issues[0].code, "PROTECTED_NODE_DELETE_BY_EVENT")
+        self.assertEqual(result.issues[0].node_id, "U3")
+
+        result = self._check(
+            updated_nodes=[NodeChange("U3", "junction")],
+            pending_events=[self._pending_event()],
+        )
+        self.assertEqual(result.issues[0].code, "PROTECTED_SINK_TYPE_CHANGE")
+
+    def test_protected_endpoint_node_delete(self):
+        result = self._check(
+            deleted_node_ids=["D"], pending_events=[self._pending_event()]
+        )
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "PROTECTED_NODE_DELETE_BY_EVENT")
+
+    def test_bypass_branch_breaks_isolation_rejected(self):
+        # P4 关闭隔离 D；新增 A-D 无阀支路会让 P6 的 D 端重新进水
+        from app.planning import PipeChange
+
+        pipes = dict(self.pipes)
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        from app.planning import check_revision
+
+        result = check_revision(
+            self.nodes,
+            pipes,
+            added_nodes=[],
+            updated_nodes=[],
+            deleted_node_ids=[],
+            added_pipes=[PipeChange("P9", "A", "D", has_valve=False)],
+            updated_pipes=[],
+            deleted_pipe_ids=[],
+            pending_events=[self._pending_event()],
+        )
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "REVISION_FAULT_REACHABLE")
+        self.assertEqual(result.issues[0].event_id, 1)
+        self.assertEqual(result.issues[0].pipe_id, "P6")
+
+    def test_safe_revision_while_pending(self):
+        from app.planning import NodeChange, PipeChange
+
+        # 关 P4 状态下在水源侧（A）扩展，不破坏 D 区隔离
+        pipes = dict(self.pipes)
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        from app.planning import check_revision
+
+        result = check_revision(
+            self.nodes,
+            pipes,
+            added_nodes=[NodeChange("U9", "sink")],
+            updated_nodes=[],
+            deleted_node_ids=[],
+            added_pipes=[PipeChange("P9", "A", "U9", has_valve=True)],
+            updated_pipes=[],
+            deleted_pipe_ids=[],
+            pending_events=[self._pending_event()],
+        )
+        self.assertTrue(result.valid, [i.code for i in result.issues])
+        # 已关阀位在候选管网中保持关闭
+        self.assertTrue(result.new_pipes["P4"].valve_closed)
+        self.assertFalse(result.new_pipes["P9"].valve_closed)
+
+    def test_restored_events_are_not_protected(self):
+        from app.planning import EVENT_RESTORED
+
+        event = IsolationEvent(
+            1, "P6", ("P4",), affected_sink_ids=("U3",), status=EVENT_RESTORED,
+        )
+        # 已复供事件不再保护其引用对象
+        result = self._check(deleted_pipe_ids=["P6"], pending_events=[event])
+        # 删除 P6 会让 U3 成为悬挂节点引用？不会：仅删管段，节点仍在，结构合法
+        self.assertTrue(result.valid, [i.code for i in result.issues])
+
+    def test_multiple_pending_events_protect_shared_object(self):
+        # 两个待修复事件都关 P4：删除 P4 时按事件分别给出两条保护明细
+        e1 = IsolationEvent(1, "P6", ("P4",), affected_sink_ids=("U3",))
+        e2 = IsolationEvent(2, "P5", ("P4",), affected_sink_ids=("U2",))
+        result = self._check(deleted_pipe_ids=["P4"], pending_events=[e1, e2])
+        self.assertFalse(result.valid)
+        hits = [i for i in result.issues if i.pipe_id == "P4"]
+        self.assertEqual({i.event_id for i in hits}, {1, 2})
+        self.assertTrue(all(i.code == "PROTECTED_PIPE_DELETE_BY_EVENT" for i in hits))
+
+    def test_delete_shared_endpoint_node_dangling_rejected(self):
+        # U1 只被 P3 引用：删除 U1 导致 P3 悬空 -> PIPE_ENDPOINT_UNKNOWN
+        result = self._check(deleted_node_ids=["U1"])
+        self.assertFalse(result.valid)
+        self.assertEqual(result.issues[0].code, "PIPE_ENDPOINT_UNKNOWN")
+
+
 if __name__ == "__main__":
     unittest.main()

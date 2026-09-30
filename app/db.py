@@ -12,7 +12,15 @@ import psycopg2.extras
 from psycopg2.errors import UndefinedTable
 
 from .config import get_settings
-from .planning import EVENT_PENDING, EVENT_RESTORED, IsolationEvent, Node, Pipe, PlanResult
+from .planning import (
+    EVENT_PENDING,
+    EVENT_RESTORED,
+    IsolationEvent,
+    Node,
+    Pipe,
+    PlanResult,
+    RevisionCheck,
+)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS network_meta (
@@ -183,6 +191,107 @@ def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
             "UPDATE network_meta SET version = 1, updated_at = now() WHERE id = 1"
         )
     return 1
+
+
+# ---------------------------------------------------------------- 局部修订
+
+
+def apply_revision(conn, expected_version: int, check: RevisionCheck) -> dict:
+    """在已开启的事务中原子应用局部修订。
+
+    调用方须先基于当前快照完成 check_revision（valid=True）。
+    本函数只负责：锁行 → 版本比对 → 增改删节点/管段 → 版本 +1。
+    不清空隔离事件；阀位真值已在候选管网中保留/置为开启，这里原样落库。
+    版本过期抛出 VersionConflict；任何 SQL 失败由外层事务整体回滚。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
+        row = cur.fetchone()
+        current_version = row[0] if row else 0
+        if current_version != expected_version:
+            raise VersionConflict(current_version, expected_version)
+
+        # 删除：先管段后节点，避免外键约束
+        if check.deleted_pipe_ids:
+            cur.execute(
+                "DELETE FROM pipes WHERE id = ANY(%s)", (check.deleted_pipe_ids,)
+            )
+        if check.deleted_node_ids:
+            cur.execute(
+                "DELETE FROM nodes WHERE id = ANY(%s)", (check.deleted_node_ids,)
+            )
+
+        # 新增节点须先于新增/修改管段（外键要求端点存在）
+        new_nodes = [
+            check.new_nodes[nid]
+            for nid in check.added_node_ids
+            if nid in check.new_nodes
+        ]
+        if new_nodes:
+            cur.executemany(
+                "INSERT INTO nodes (id, type, name) VALUES (%s, %s, %s)",
+                [(n.id, n.type, n.name) for n in new_nodes],
+            )
+
+        updated_nodes = [
+            check.new_nodes[nid]
+            for nid in check.updated_node_ids
+            if nid in check.new_nodes
+        ]
+        if updated_nodes:
+            cur.executemany(
+                "UPDATE nodes SET type = %s, name = %s WHERE id = %s",
+                [(n.type, n.name, n.id) for n in updated_nodes],
+            )
+
+        new_pipes = [
+            check.new_pipes[pid]
+            for pid in check.added_pipe_ids
+            if pid in check.new_pipes
+        ]
+        if new_pipes:
+            cur.executemany(
+                "INSERT INTO pipes (id, from_node, to_node, has_valve, valve_closed, name) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                [
+                    (p.id, p.from_node, p.to_node, p.has_valve, p.valve_closed, p.name)
+                    for p in new_pipes
+                ],
+            )
+
+        updated_pipes = [
+            check.new_pipes[pid]
+            for pid in check.updated_pipe_ids
+            if pid in check.new_pipes
+        ]
+        if updated_pipes:
+            cur.executemany(
+                "UPDATE pipes SET from_node = %s, to_node = %s, has_valve = %s, "
+                "valve_closed = %s, name = %s WHERE id = %s",
+                [
+                    (
+                        p.from_node,
+                        p.to_node,
+                        p.has_valve,
+                        p.valve_closed,
+                        p.name,
+                        p.id,
+                    )
+                    for p in updated_pipes
+                ],
+            )
+
+        new_version = current_version + 1
+        cur.execute(
+            "UPDATE network_meta SET version = %s, updated_at = now() WHERE id = 1",
+            (new_version,),
+        )
+
+    return {
+        "version": new_version,
+        "node_count": len(check.new_nodes),
+        "pipe_count": len(check.new_pipes),
+    }
 
 
 # ---------------------------------------------------------------- 隔离提交
